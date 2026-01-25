@@ -1,0 +1,2 @@
+[console_scripts]
+xpid = xpid.cli:main
