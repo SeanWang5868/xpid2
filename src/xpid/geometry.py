@@ -18,6 +18,28 @@ def get_pi_info(atoms: List[gemmi.Atom]) -> Tuple[gemmi.Position, np.ndarray, np
     
     return pi_center, center_array, normal_vector, b_mean
 
+def calculate_planarity_deviation(atoms: List[gemmi.Atom]) -> float:
+    """Calculate maximum deviation from the best-fit plane (in Å)."""
+    if len(atoms) < 3:
+        return 999.0
+    
+    _, center_arr, normal, _ = get_pi_info(atoms)
+    norm_normal = np.linalg.norm(normal)
+    if norm_normal == 0:
+        return 999.0
+    
+    normal = normal / norm_normal  # Normalize
+    
+    max_dev = 0.0
+    for atom in atoms:
+        pos_arr = np.array(atom.pos.tolist())
+        vec = pos_arr - center_arr
+        dev = np.abs(np.dot(normal, vec))
+        if dev > max_dev:
+            max_dev = dev
+    
+    return max_dev
+
 def calculate_distance(pos1_array: np.ndarray, pos2_array: np.ndarray) -> float:
     return np.linalg.norm(pos1_array - pos2_array)
 

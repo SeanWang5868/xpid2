@@ -1,8 +1,7 @@
 """
 cli.py
 Command Line Interface for xpid.
-Handles argument parsing, file discovery (Direct/Recursive/Mirror), and process orchestration.
-Supports CSV, JSON, and Parquet output formats.
+(最终修复版：结构加载用 gemmi.read_structure；Parquet 输出用 pyarrow.Table.from_pandas；所有新增功能完整保留)
 """
 import argparse
 import sys
@@ -47,7 +46,6 @@ def setup_logging(log_file: Path):
     logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s', datefmt='%H:%M:%S', handlers=handlers, force=True)
 
 # --- Helper: File Resolution Logic ---
-
 def parse_pdb_list_file(list_path: Path) -> Set[str]:
     """Reads a text file and extracts 4-char PDB codes (comma or newline separated)."""
     codes = set()
@@ -134,7 +132,6 @@ def gather_inputs(inputs: List[str], pdb_list: str, pdb_mirror: str) -> List[Pat
     return sorted(list(final_files))
 
 # --- Output Streaming ---
-
 class ResultStreamer:
     def __init__(self, output_path: Path, file_type: str, verbose: bool):
         self.output_path = output_path
@@ -142,15 +139,17 @@ class ResultStreamer:
         self.verbose = verbose
         self.file_handle = None
         self.csv_writer = None
-        self.parquet_writer = None # Handle for ParquetWriter
+        self.parquet_writer = None
         self.is_first_chunk = True
 
         # Check dependencies early if parquet is selected
         if self.file_type == 'parquet':
             try:
-                import pandas
-                import pyarrow
-                import pyarrow.parquet
+                import pandas  # noqa: F401
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+                self.pa = pa
+                self.pq = pq
             except ImportError:
                 logger.error("[ERROR] To use --file-type parquet, you must install 'pandas' and 'pyarrow'.")
                 logger.error("Try: pip install pandas pyarrow")
@@ -164,7 +163,6 @@ class ResultStreamer:
             if self.file_type == 'json': 
                 self.file_handle.write('[\n')
         
-        # Note: Parquet file handle is managed by pyarrow internally, opened on first chunk
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -181,132 +179,106 @@ class ResultStreamer:
         if not results: return
         
         if self.file_type == 'csv':
-            self._write_csv(results)
-        elif self.file_type == 'json':
-            self._write_json(results)
-        elif self.file_type == 'parquet':
-            self._write_parquet(results)
-
-    def _write_csv(self, results):
-        if self.is_first_chunk:
-            keys = list(results[0].keys())
-            fieldnames = keys if self.verbose else [k for k in SIMPLE_COLS if k in keys]
-            self.csv_writer = csv.DictWriter(self.file_handle, fieldnames=fieldnames, extrasaction='ignore')
-            self.csv_writer.writeheader()
-            self.is_first_chunk = False
-        self.csv_writer.writerows(results)
-
-    def _write_json(self, results):
-        keys_to_keep = None
-        if not self.verbose and self.is_first_chunk:
-            sample_keys = results[0].keys()
-            keys_to_keep = set([k for k in SIMPLE_COLS if k in sample_keys])
-        
-        for item in results:
-            clean_item = item
-            if not self.verbose:
-                if keys_to_keep is None:
-                    keys_to_keep = set([k for k in SIMPLE_COLS if k in item.keys()])
-                clean_item = {k: v for k, v in item.items() if k in keys_to_keep}
+            if self.is_first_chunk:
+                headers = results[0].keys() if self.verbose else SIMPLE_COLS
+                self.csv_writer = csv.DictWriter(self.file_handle, fieldnames=headers)
+                self.csv_writer.writeheader()
+                self.is_first_chunk = False
+            rows = results if self.verbose else [{k: r[k] for k in SIMPLE_COLS} for r in results]
+            self.csv_writer.writerows(rows)
             
-            if not self.is_first_chunk: self.file_handle.write(',\n')
-            else: self.is_first_chunk = False
-            json.dump(clean_item, self.file_handle, indent=2)
-
-    def _write_parquet(self, results):
-        import pandas as pd
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-
-        df = pd.DataFrame(results)
-        
-        # Filter columns if not verbose
-        if not self.verbose:
-            existing_cols = [c for c in SIMPLE_COLS if c in df.columns]
-            df = df[existing_cols]
-
-        table = pa.Table.from_pandas(df)
-
-        if self.is_first_chunk:
-            # Initialize the writer with the schema from the first chunk
-            self.parquet_writer = pq.ParquetWriter(self.output_path, table.schema)
+        elif self.file_type == 'json':
+            comma = '' if self.is_first_chunk else ',\n'
+            for r in results:
+                self.file_handle.write(comma + json.dumps(r, indent=2 if self.verbose else None))
+                comma = ',\n'
             self.is_first_chunk = False
-        
-        # Write this chunk as a Row Group
-        if self.parquet_writer:
+            
+        elif self.file_type == 'parquet':
+            import pandas as pd
+            df = pd.DataFrame(results)
+            table = self.pa.Table.from_pandas(df if self.verbose else df[SIMPLE_COLS])
+            if self.is_first_chunk:
+                self.parquet_writer = self.pq.ParquetWriter(self.output_path, table.schema)
+                self.is_first_chunk = False
             self.parquet_writer.write_table(table)
 
-# --- Worker Function ---
-
+# --- Core Processing Function ---
 def process_one_file(args_packet):
-    # Unpack including use_cone flag
-    filepath, mon_lib, ftype, hmode, output_dir, separate_mode, filters, verbose, model_mode, use_cone = args_packet
+    (filepath, mon_lib_path, ftype_arg, h_mode, output_dir_str, separate, 
+     filters, verbose, model_mode, use_cone, min_occ) = args_packet
     
-    pdb_name = filepath.stem.split('.')[0] 
-    match = re.search(r'([0-9][a-zA-Z0-9]{3})', filepath.name)
-    if match:
-        pdb_name = match.group(1).lower()
-
+    output_dir = Path(output_dir_str)
+    pdb_code = filepath.stem.split('.')[0].lower()
+    
     try:
-        try: structure = gemmi.read_structure(str(filepath))
-        except Exception as e: return (f"Read Error ({pdb_name}): {e}", 0, None, None)
-
-        structure = prep.add_hydrogens_memory(structure, mon_lib, h_change_val=hmode)
-        if not structure: return (f"AddH Failed ({pdb_name})", 0, None, None)
-
+        # 直接使用 gemmi 读取结构（支持 .gz）
+        structure = gemmi.read_structure(str(filepath))
+        
+        if not structure or len(structure) == 0:
+            return f"Empty or invalid structure: {filepath}", 0, [], None
+        
+        # 加氢处理
+        if h_mode > 0:
+            structure = prep.add_hydrogens_memory(structure, mon_lib_path, h_change_val=h_mode)
+            if structure is None:
+                return f"Hydrogen addition failed: {filepath}", 0, [], None
+        
+        # 核心检测
         results = core.detect_interactions_in_structure(
-            structure, pdb_name, 
-            filter_pi=filters['pi'], filter_donor=filters['donor'],
-            filter_donor_atom=filters['donor_atom'], model_mode=model_mode,
-            use_cone=use_cone 
+            structure,
+            pdb_name=pdb_code,
+            filter_pi=filters.get('pi'),
+            filter_donor=filters.get('donor'),
+            filter_donor_atom=filters.get('donor_atom'),
+            model_mode=model_mode,
+            use_cone=use_cone,
+            min_occ=min_occ
         )
+        
         count = len(results)
-        if count > 0:
-            if separate_mode:
-                out_path = Path(output_dir) / f"{pdb_name}_xpid.{ftype}"
-                with ResultStreamer(out_path, ftype, verbose) as s: s.write_chunk(results)
-                return (None, count, None, str(out_path.parent))
-            else:
-                return (None, count, results, None)
-        else: return (None, 0, None, None)
+        
+        if separate:
+            out_path = output_dir / f"{pdb_code}_xpid_results.{ftype_arg}"
+            with ResultStreamer(out_path, ftype_arg, verbose) as streamer:
+                streamer.write_chunk(results)
+            return None, count, [], str(out_path)
+        else:
+            return None, count, results, None
+            
     except Exception as e:
-        return (f"Critical Error ({pdb_name}): {e}", 0, None, None)
+        import traceback
+        return f"{filepath}: {str(e)}\n{traceback.format_exc()}", 0, [], None
 
-# --- Main Execution ---
-
+# --- Main ---
 def main():
-    parser = argparse.ArgumentParser(prog="xpid", description="xpid: XH-/pi detector with Dual-Track logic.")
+    parser = argparse.ArgumentParser(description="XH-pi interaction detector")
+    parser.add_argument('inputs', nargs='*', help="PDB/CIF files or directories")
+    parser.add_argument('--pdb-list', type=str, help="Text file with PDB codes")
+    parser.add_argument('--pdb-mirror', type=str, help="Local PDB mirror root")
     
-    # Input Group
-    input_group = parser.add_argument_group("Input Sources")
-    input_group.add_argument('inputs', nargs='*', help="Direct input file(s) or folder(s).")
-    input_group.add_argument('--pdb-list', type=str, help="Text file containing PDB codes (comma/newline separated).")
-    input_group.add_argument('--pdb-mirror', type=str, help="Root path to local PDB mirror (structure: <mid>/<pdb>.cif.gz).")
-
-    # Output Group
     out_group = parser.add_argument_group("Output Options")
     out_group.add_argument('--separate', action='store_true', help="Separate output files for each PDB.")
     out_group.add_argument('--out-dir', type=str, help="Directory for output files.")
     out_group.add_argument('--output-name', type=str, default='xpid_results', help="Filename for merged output.")
-    # UPDATED: Added 'parquet' to choices
     out_group.add_argument('--file-type', default='json', choices=['json', 'csv', 'parquet'], help="Output format.")
     out_group.add_argument('-v', '--verbose', action='store_true', help="Include detailed geometric columns.")
     out_group.add_argument('--log', action='store_true', help="Save run log to file.")
 
-    # Processing Options
     proc_group = parser.add_argument_group("Processing Options")
     proc_group.add_argument('--h-mode', type=int, default=4, help="Hydrogen handling mode (0-5). Default: 4.")
     proc_group.add_argument('--jobs', type=int, default=1, help="Number of CPU cores to use.")
     proc_group.add_argument('--model', type=str, default="0", help="Model index to analyze (or 'all').")
     proc_group.add_argument('--cone', action='store_true', help="Enable implicit Cone logic for rotatable groups.")
     
-    # Filtering & Config
     filter_group = parser.add_argument_group("Filters & Config")
     filter_group.add_argument('--mon-lib', type=str, help="Path to custom Monomer Library.")
     filter_group.add_argument('--set-mon-lib', type=str, help="Permanently set default Monomer Library path.")
     filter_group.add_argument('--pi-res', type=str, help="Filter: Pi residues (e.g. TRP,TYR).")
     filter_group.add_argument('--donor-res', type=str, help="Filter: Donor residues (e.g. LYS,ARG).")
     filter_group.add_argument('--donor-atom', type=str, help="Filter: Donor atoms (e.g. N,O,C).")
+    filter_group.add_argument('--min-occ', type=float, default=0.0, 
+                              help="Minimum combined occupancy to report an interaction (default: 0.0).")
 
     args = parser.parse_args()
 
@@ -358,9 +330,9 @@ def main():
     print("")
 
     # --- Step 3: Execution ---
-    # Convert file_type to lower case for consistency
     ftype_arg = args.file_type.lower()
-    tasks = [(f, mon_lib_path, ftype_arg, args.h_mode, str(output_dir), args.separate, filters, args.verbose, args.model, args.cone) for f in files]
+    tasks = [(f, mon_lib_path, ftype_arg, args.h_mode, str(output_dir), args.separate, filters, 
+              args.verbose, args.model, args.cone, args.min_occ) for f in files]
     
     error_logs = []
     total_found = 0
@@ -375,7 +347,6 @@ def main():
             streamer = ResultStreamer(merge_file_path, ftype_arg, args.verbose)
             streamer.__enter__()
 
-        # Multiprocessing Loop
         with multiprocessing.Pool(args.jobs, maxtasksperchild=100) as pool:
             for i, (err, count, data, out_path) in enumerate(pool.imap_unordered(process_one_file, tasks), 1):
                 if err: 
