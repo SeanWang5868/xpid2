@@ -216,7 +216,7 @@ def _detect_residue(pdb_name, resolution, model, model_id, chain, residue, ns, s
                     if (x_res_name, x_atom.name) in flexible_donors:
                         # 阵营 B：柔性基团 - 经典 360° 全景扫描 (36 个点)
                         h_candidates_cone = geometry.generate_rotated_hydrogens(
-                            parent_pos_arr, x_pos_arr, x_atom.element.name, num_samples=36
+                            parent_pos_arr, x_pos_arr, x_atom.element.name, num_samples=72
                         )
                     else:
                         # 阵营 A：受限于交错态的刚性转子 (如甲基、铵基)沿用 CCP4 找好的交错态(显式H)，仅允许小幅热振动摆动
