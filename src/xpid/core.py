@@ -9,7 +9,7 @@ import numpy as np
 from typing import List, Dict, Any, Optional, Union, Set
 from . import config
 from . import geometry
-from . import residue_ss
+from . import ss
 
 BLOCKING_METALS = {
     'ZN', 'FE', 'CU', 'MN', 'MG', 'CO', 'NI', 'CA', 'CD', 'HG',
@@ -48,7 +48,7 @@ def detect_interactions_in_structure(structure: gemmi.Structure,
 
     resolution = structure.resolution if structure.resolution else 0.0
 
-    ss_index = residue_ss.build_index(structure)
+    ss_index = ss.build_index(structure)
         
     for model, model_id in models_with_ids:
         ns = gemmi.NeighborSearch(model, structure.cell, config.DIST_SEARCH_LIMIT)
@@ -150,40 +150,12 @@ def _detect_residue(pdb_name, resolution, model, model_id, chain, residue, ns, s
         
         proj_threshold = 2.0 if ring_size == 6 else 1.6
         
-        detected_mode = "Explicit"
-        if use_cone and x_res_name in config.ROTATABLE_MAPPING:
-            parent_name = config.ROTATABLE_MAPPING[x_res_name].get(x_atom.name)
-            if parent_name:
-                parent_atom = next((a for a in x_res if a.name == parent_name), None)
-                
-                if parent_atom:
-                    parent_pos_arr = np.array(parent_atom.pos.tolist())
-                    cone_cfg = config.get_cone_params(x_atom.element.name)
-                    
-                    cone_pass, cone_angle, delta = geometry.calculate_cone_alignment(
-                        parent_pos_arr, x_pos_arr, pi_center_arr, 
-                        cone_cfg['angle'], cone_cfg['tolerance']
-                    )
+        # 标志位：是否已经在显式氢中找到了相互作用
+        found_explicit_interaction = False
 
-                    if cone_pass:
-                        is_plevin = (dist_x_pi < max_dist and xpcn_angle < 25.0)
-                        is_hudson = (dist_x_pi <= max_dist and proj_dist is not None and proj_dist <= proj_threshold)
-
-                        if is_plevin or is_hudson:
-                            detected_mode = "Implicit/Cone"
-                            final_h_name = "(virt)"
-                            final_theta = 0.0
-                            final_xh_pi_angle = 180.0
-                            cone_delta = round(delta, 1)
-                            
-                            _record_hit(hits, pdb_name, model_id, resolution, chain, residue, 
-                                        x_cra, x_atom, final_h_name, dist_x_pi, 
-                                        int(is_plevin), int(is_hudson), mode, 
-                                        pi_center_arr, pi_b_mean, x_pos_arr, ss_index, 
-                                        final_theta, final_xh_pi_angle, xpcn_angle, proj_dist, 
-                                        detected_mode, cone_delta, combined_occ, ring_size, min_occ)
-                            continue
-
+        # ---------------------------------------------------------------------
+        # 🔵 第一梯队：显式精确几何算法 (优先尊重配体库默认加氢的低位阻构象)
+        # ---------------------------------------------------------------------
         h_candidates = ns.find_atoms(x_atom.pos, alt=x_atom.altloc, radius=config.DIST_CUTOFF_H)
         
         for h_mark in h_candidates:
@@ -195,7 +167,6 @@ def _detect_residue(pdb_name, resolution, model, model_id, chain, residue, ns, s
                 continue
             
             h_combined_occ = min(combined_occ, h_atom.occ)
-            
             h_pos_arr = np.array(h_atom.pos.tolist())
             
             xh_pi_angle = geometry.calculate_xh_picenter_angle(pi_center_arr, x_pos_arr, h_pos_arr)
@@ -217,12 +188,104 @@ def _detect_residue(pdb_name, resolution, model, model_id, chain, residue, ns, s
                 hudson = 1
             
             if plevin == 1 or hudson == 1:
+                found_explicit_interaction = True
                 _record_hit(hits, pdb_name, model_id, resolution, chain, residue, 
                             x_cra, x_atom, h_atom.name, dist_x_pi, 
                             plevin, hudson, mode, 
                             pi_center_arr, pi_b_mean, x_pos_arr, ss_index, 
                             theta, xh_pi_angle, xpcn_angle, proj_dist, 
-                            detected_mode, None, h_combined_occ, ring_size, min_occ)
+                            "Explicit", None, h_combined_occ, ring_size, min_occ)
+
+        # ---------------------------------------------------------------------
+        # 🔴 第二梯队：热力学限制的诱导契合与构象救援算法
+        # ---------------------------------------------------------------------
+        if not found_explicit_interaction and use_cone and x_res_name in config.ROTATABLE_MAPPING:
+            parent_name = config.ROTATABLE_MAPPING[x_res_name].get(x_atom.name)
+            
+            if parent_name:
+                parent_atom = next((a for a in x_res if a.name == parent_name), None)
+                
+                if parent_atom:
+                    parent_pos_arr = np.array(parent_atom.pos.tolist())
+                    
+                    # 具有诱导契合能力的柔性基团 (低旋转势垒，允许 360° 连续扫描)
+                    flexible_donors = {('SER', 'OG'), ('THR', 'OG1'), ('TYR', 'OH'), ('CYS', 'SG')}
+                    
+                    # 生成当前评估的一批虚拟氢候选位置
+                    h_candidates_cone = []
+                    if (x_res_name, x_atom.name) in flexible_donors:
+                        # 阵营 B：柔性基团 - 经典 360° 全景扫描 (36 个点)
+                        h_candidates_cone = geometry.generate_rotated_hydrogens(
+                            parent_pos_arr, x_pos_arr, x_atom.element.name, num_samples=36
+                        )
+                    else:
+                        # 阵营 A：受限于交错态的刚性转子 (如甲基、铵基)沿用 CCP4 找好的交错态(显式H)，仅允许小幅热振动摆动
+                        axis = x_pos_arr - parent_pos_arr
+                        axis_norm = np.linalg.norm(axis)
+                        if axis_norm > 1e-5:
+                            axis = axis / axis_norm
+                            
+                            # 定义摆动角度 (例如 ±10度 和 ±20度，模拟热力学谷底的微小涨落)
+                            wobble_angles_deg = [angle for angle in range(-20, 21, 5) if angle != 0]
+                            
+                            for h_mark in h_candidates: # 复用第一梯队未能命中的显式氢
+                                h_pos_orig = np.array(h_mark.to_cra(model).atom.pos.tolist())
+                                vec_xh = h_pos_orig - x_pos_arr
+                                
+                                for angle_deg in wobble_angles_deg:
+                                    theta_rad = np.radians(angle_deg)
+                                    cos_theta = np.cos(theta_rad)
+                                    sin_theta = np.sin(theta_rad)
+                                    
+                                    # Rodrigues' rotation formula 绕轴旋转向量
+                                    cross_prod = np.cross(axis, vec_xh)
+                                    dot_prod = np.dot(axis, vec_xh)
+                                    
+                                    vec_xh_rotated = (vec_xh * cos_theta + 
+                                                      cross_prod * sin_theta + 
+                                                      axis * dot_prod * (1 - cos_theta))
+                                    
+                                    h_pos_wobbled = x_pos_arr + vec_xh_rotated
+                                    h_candidates_cone.append(h_pos_wobbled)
+
+                    # 2. 统一对生成的候选氢原子进行几何评估
+                    best_hit = None
+                    best_xh_angle = -1.0  # 用于寻找最接近 180 度的最优构象
+                    
+                    for h_pos_np in h_candidates_cone:
+                        theta = geometry.calculate_hudson_theta(pi_center_arr, x_pos_arr, h_pos_np, pi_normal)
+                        xh_pi_angle = geometry.calculate_xh_picenter_angle(pi_center_arr, x_pos_arr, h_pos_np)
+                        
+                        if theta is None or xh_pi_angle is None:
+                            continue
+                            
+                        # 严格套用同样的 Plevin 和 Hudson 标准
+                        is_plevin_cand = (dist_x_pi < max_dist and xpcn_angle < 25.0 and xh_pi_angle >= 120.0)
+                        is_hudson_cand = (dist_x_pi <= max_dist and proj_dist is not None and proj_dist <= proj_threshold and theta <= 40.0)
+                        
+                        if is_plevin_cand or is_hudson_cand:
+                            if xh_pi_angle > best_xh_angle:
+                                best_xh_angle = xh_pi_angle
+                                best_hit = {
+                                    'theta': theta,
+                                    'xh_pi_angle': xh_pi_angle,
+                                    'is_plevin': 1 if is_plevin_cand else 0,
+                                    'is_hudson': 1 if is_hudson_cand else 0,
+                                    'h_pos_np': h_pos_np
+                                }
+
+                    if best_hit is not None:
+                        detected_mode = "Implicit/Cone_Rescue"
+                        final_h_name = "(virt)"
+                        final_theta = best_hit['theta']
+                        final_xh_pi_angle = best_hit['xh_pi_angle']
+                        
+                        _record_hit(hits, pdb_name, model_id, resolution, chain, residue, 
+                                    x_cra, x_atom, final_h_name, dist_x_pi, 
+                                    int(best_hit['is_plevin']), int(best_hit['is_hudson']), mode, 
+                                    pi_center_arr, pi_b_mean, x_pos_arr, ss_index, 
+                                    final_theta, final_xh_pi_angle, xpcn_angle, proj_dist, 
+                                    detected_mode, 0.0, combined_occ, ring_size, min_occ)
 
     return hits
 
@@ -237,8 +300,8 @@ def _record_hit(hits: List[Dict[str, Any]], pdb: str, mid: str, res: float, pi_c
     if combined_occ < min_occ:
         return
     
-    pi_ss_type, pi_ss_uid = residue_ss.get_info(pi_chain.name, pi_res.seqid.num, ss_index)
-    x_ss_type, x_ss_uid = residue_ss.get_info(x_cra.chain.name, x_cra.residue.seqid.num, ss_index)
+    pi_ss_type, pi_ss_uid = ss.get_info(pi_chain.name, pi_res.seqid.num, ss_index)
+    x_ss_type, x_ss_uid = ss.get_info(x_cra.chain.name, x_cra.residue.seqid.num, ss_index)
 
     seq_sep = 0
     if pi_chain.name == x_cra.chain.name:

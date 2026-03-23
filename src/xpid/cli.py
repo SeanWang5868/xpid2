@@ -83,15 +83,41 @@ def resolve_mirror_path(mirror_root: Path, pdb_code: str) -> Path:
 
     return None
 
-def gather_inputs(inputs: List[str], pdb_list: str, pdb_mirror: str) -> List[Path]:
+def resolve_redo_path(mirror_root: Path, pdb_code: str) -> Path:
+    """
+    Resolves a PDB code to a file path in a PDB-REDO mirror.
+    Tries various common PDB-REDO directory structures.
+    """
+    middle_two = pdb_code[1:3].lower()
+    
+    candidates = [
+        # PDB-REDO 官方 rsync 结构: /ab/1abc/1abc_final.cif
+        mirror_root / middle_two / pdb_code / f"{pdb_code}_final.cif",
+        mirror_root / middle_two / pdb_code / f"{pdb_code}_final.cif.gz",
+        # 简化版结构: /ab/1abc_final.cif
+        mirror_root / middle_two / f"{pdb_code}_final.cif",
+        mirror_root / middle_two / f"{pdb_code}_final.cif.gz",
+        # 与常规 PDB 完全相同的结构: /ab/1abc.cif
+        mirror_root / middle_two / f"{pdb_code}.cif",
+        mirror_root / middle_two / f"{pdb_code}.cif.gz",
+    ]
+    
+    for path in candidates:
+        if path.exists():
+            return path
+            
+    return None
+
+def gather_inputs(inputs: List[str], pdb_list: str, pdb_mirror: str, redo_mirror: str) -> List[Path]:
     """
     Combines direct inputs and mirror lookups into a final list of file paths.
+    Prioritizes PDB-REDO mirror over standard PDB mirror if both are provided.
     """
     final_files = set()
     
     # 1. Process Direct Inputs (Files or Directories)
     if inputs:
-        pattern = re.compile(r'^[a-zA-Z0-9]{4}\.(cif|pdb)(\.gz)?$', re.IGNORECASE)
+        pattern = re.compile(r'^[a-zA-Z0-9]{4}(_final)?\.(cif|pdb)(\.gz)?$', re.IGNORECASE)
         for inp in inputs:
             path = Path(inp)
             if path.is_file(): 
@@ -101,33 +127,53 @@ def gather_inputs(inputs: List[str], pdb_list: str, pdb_mirror: str) -> List[Pat
                     if p.is_file() and pattern.match(p.name): 
                         final_files.add(p.resolve())
 
-    # 2. Process PDB List + Mirror
+    # 2. Process PDB List + Mirrors
     if pdb_list:
-        if not pdb_mirror:
-            logger.error("Argument --pdb-mirror is REQUIRED when using --pdb-list.")
+        if not pdb_mirror and not redo_mirror:
+            logger.error("Argument --pdb-mirror or --redo-mirror is REQUIRED when using --pdb-list.")
             sys.exit(1)
         
-        mirror_root = Path(pdb_mirror).resolve()
-        if not mirror_root.exists():
-            logger.error(f"Mirror directory not found: {mirror_root}")
+        pdb_root = Path(pdb_mirror).resolve() if pdb_mirror else None
+        redo_root = Path(redo_mirror).resolve() if redo_mirror else None
+
+        if pdb_root and not pdb_root.exists():
+            logger.error(f"PDB Mirror directory not found: {pdb_root}")
+            sys.exit(1)
+        if redo_root and not redo_root.exists():
+            logger.error(f"PDB-REDO Mirror directory not found: {redo_root}")
             sys.exit(1)
 
         codes = parse_pdb_list_file(Path(pdb_list))
         logger.info(f"Parsed {len(codes)} PDB codes from list.")
         
-        found_count = 0
+        found_redo_count = 0
+        found_pdb_count = 0
         missing_codes = []
 
         for code in codes:
-            fpath = resolve_mirror_path(mirror_root, code)
+            fpath = None
+            
+            # 优先级 1: 尝试从 PDB-REDO 镜像寻找
+            if redo_root:
+                fpath = resolve_redo_path(redo_root, code)
+                if fpath:
+                    found_redo_count += 1
+            
+            # 优先级 2: 如果 REDO 中没有，尝试从常规 PDB 镜像寻找
+            if not fpath and pdb_root:
+                fpath = resolve_mirror_path(pdb_root, code)
+                if fpath:
+                    found_pdb_count += 1
+                    
             if fpath:
                 final_files.add(fpath)
-                found_count += 1
             else:
                 missing_codes.append(code)
         
+        logger.info(f"Found {found_redo_count} in PDB-REDO, {found_pdb_count} in standard PDB.")
+        
         if missing_codes:
-            logger.warning(f"Could not find {len(missing_codes)} PDBs in mirror (e.g., {', '.join(missing_codes[:5])}...)")
+            logger.warning(f"Could not find {len(missing_codes)} PDBs in any mirror (e.g., {', '.join(missing_codes[:5])}...)")
 
     return sorted(list(final_files))
 
@@ -256,6 +302,7 @@ def main():
     parser.add_argument('inputs', nargs='*', help="PDB/CIF files or directories")
     parser.add_argument('--pdb-list', type=str, help="Text file with PDB codes")
     parser.add_argument('--pdb-mirror', type=str, help="Local PDB mirror root")
+    parser.add_argument('--redo-mirror', type=str, help="Local PDB-REDO mirror root (prioritized over standard PDB)")
     
     out_group = parser.add_argument_group("Output Options")
     out_group.add_argument('--separate', action='store_true', help="Separate output files for each PDB.")
@@ -303,7 +350,7 @@ def main():
 
     # --- Step 1: Gather Files ---
     logger.info("--- Xpid Initialization ---")
-    files = gather_inputs(args.inputs, args.pdb_list, args.pdb_mirror)
+    files = gather_inputs(args.inputs, args.pdb_list, args.pdb_mirror, args.redo_mirror)
     
     if not files:
         logger.error("[ERROR] No valid input files found. Please check inputs or list/mirror paths.")

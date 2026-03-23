@@ -200,17 +200,48 @@ ROTATABLE_MAPPING: Dict[str, Dict[str, str]] = {
     'LYS': {'NZ': 'CE'}
 }
 
-CONE_PARAMS = {
-    'METHYL': {'angle': 70.5, 'tolerance': 25.0},
-    'OH_SH':  {'angle': 70.5, 'tolerance': 15.0},
-    'AMINE':  {'angle': 70.5, 'tolerance': 20.0}
+# 阵营 B: 具有诱导契合能力的柔性基团 (低旋转势垒，约 1-2 kcal/mol，允许 360° 连续扫描)
+FLEXIBLE_DONORS = {'OG', 'OG1', 'OH', 'SG'}  
+
+# 阵营 A: 受限于交错态的刚性转子 (高三重扭转势垒，约 3 kcal/mol，仅允许 3 态离散扫描)
+RIGID_DONORS = {'CB', 'CG1', 'CG2', 'CD1', 'CD2', 'CE', 'NZ'} 
+
+# 祖父原子映射字典 (Grandparent Mapping) 
+# 必需！用于定义参考平面，从而计算出甲基/铵基那 3 个绝对准确的交错态位置
+GRANDPARENT_MAPPING: Dict[str, Dict[str, str]] = {
+    'ALA': {'CB': 'N'},           # CA 的母体，用骨架 N 作为参考相
+    'VAL': {'CG1': 'CA', 'CG2': 'CA'},
+    'LEU': {'CD1': 'CB', 'CD2': 'CB'},
+    'ILE': {'CD1': 'CB', 'CG2': 'CA'},
+    'MET': {'CE': 'CG'},
+    'MSE': {'CE': 'CG'},
+    'THR': {'CG2': 'CA', 'OG1': 'CA'},
+    'SER': {'OG': 'CA'},
+    'TYR': {'OH': 'CE1'},         # 实际上分在柔性组，这里备用
+    'CYS': {'SG': 'CA'},
+    'LYS': {'NZ': 'CD'}
 }
 
-def get_cone_params(atom_element: str) -> Dict[str, float]:
-    if atom_element == 'C': return CONE_PARAMS['METHYL']
-    if atom_element in ('O', 'S'): return CONE_PARAMS['OH_SH']
-    if atom_element == 'N': return CONE_PARAMS['AMINE']
-    return {'angle': 70.5, 'tolerance': 20.0}
+
+BOND_LENGTHS = {
+    'C': 1.09, 
+    'N': 1.01, 
+    'O': 0.96, 
+    'S': 1.33
+}
+TETRAHEDRAL_ANGLE = 109.5  # sp3 杂化的典型 Parent-X-H 角度
+
+# CONE_PARAMS = {
+#     'METHYL': {'angle': 70.5, 'tolerance': 25.0},
+#     'OH_SH':  {'angle': 70.5, 'tolerance': 15.0},
+#     'AMINE':  {'angle': 70.5, 'tolerance': 20.0}
+# }
+
+# def get_cone_params(atom_element: str) -> Dict[str, float]:
+#     if atom_element == 'C': return CONE_PARAMS['METHYL']
+#     if atom_element in ('O', 'S'): return CONE_PARAMS['OH_SH']
+#     if atom_element == 'N': return CONE_PARAMS['AMINE']
+#     return {'angle': 70.5, 'tolerance': 20.0}
 
 DIST_SEARCH_LIMIT = 6.0
 THRESHOLDS = {

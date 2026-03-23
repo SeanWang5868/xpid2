@@ -36,9 +36,31 @@ def add_hydrogens_memory(structure: gemmi.Structure,
             try: monlib.read_monomer_lib(mon_lib_path, missing)
             except: pass
 
-        gemmi.prepare_topology(structure, monlib, model_index=0, h_change=h_change_val, reorder=False, ignore_unknown_links=True)
+        # ---------------------------------------------------------
+        # 🌟 修复区：增加错误重试机制 (Fallback Mechanism)
+        # ---------------------------------------------------------
+        try:
+            # 第一次尝试：保留所有原始连接信息进行拓扑构建
+            gemmi.prepare_topology(structure, monlib, model_index=0, h_change=h_change_val, reorder=False, ignore_unknown_links=True)
+        except Exception as topo_err:
+            err_msg = str(topo_err).lower()
+            # 扩大捕获范围：只要报错信息里包含 "link" 这个词，统统进入抢救流程
+            if "link" in err_msg:
+                # 打印具体的报错原因，方便你查看
+                logger.warning(f"  -> Bad explicit link detected: '{str(topo_err)}'. Clearing connections and retrying...")
+                # 清除 CIF 文件中携带的所有 explicit links
+                structure.connections.clear()
+                
+                # 第二次尝试：依赖距离和标准氨基酸字典重新构建拓扑加氢
+                gemmi.prepare_topology(structure, monlib, model_index=0, h_change=h_change_val, reorder=False, ignore_unknown_links=True)
+            else:
+                # 如果是其他严重的底层错误，抛出交给外层处理
+                raise topo_err
+        # ---------------------------------------------------------
+
         structure.setup_cell_images()
         return structure
+        
     except Exception as e:
         logger.error(f"Topology failed: {e}")
         return None

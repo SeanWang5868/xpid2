@@ -5,6 +5,7 @@ Geometric calculations including Plevin, Hudson, and Cone alignment.
 import numpy as np
 import gemmi
 from typing import Tuple, Optional, List
+from . import config
 
 def get_pi_info(atoms: List[gemmi.Atom]) -> Tuple[gemmi.Position, np.ndarray, np.ndarray, float]:
     positions = np.array([atom.pos.tolist() for atom in atoms])
@@ -57,8 +58,8 @@ def calculate_xpcn_angle(x_pos: np.ndarray, pi_center: np.ndarray, pi_normal: np
     return angle
 
 def calculate_xh_picenter_angle(pi_center: np.ndarray, x_pos: np.ndarray, h_pos: np.ndarray) -> Optional[float]:
-    v_hx = h_pos - x_pos
-    v_hc = h_pos - pi_center 
+    v_hx = x_pos - h_pos
+    v_hc = pi_center - h_pos 
     norm_hx = np.linalg.norm(v_hx)
     norm_hc = np.linalg.norm(v_hc)
     if norm_hx == 0 or norm_hc == 0: return None
@@ -117,3 +118,37 @@ def calculate_cone_alignment(parent_pos: np.ndarray, x_pos: np.ndarray, pi_cente
     
     passed = delta <= tolerance
     return passed, alpha, delta
+
+def generate_rotated_hydrogens(parent_pos: np.ndarray, x_pos: np.ndarray, element: str, num_samples: int = 36) -> list:
+    axis = x_pos - parent_pos
+    norm_axis = np.linalg.norm(axis)
+    if norm_axis == 0: 
+        return []
+    u = axis / norm_axis 
+    
+    # 2. 构建与轴垂直的两个正交基向量 (v, w)
+    arbitrary_vec = np.array([1.0, 0.0, 0.0])
+    if np.abs(np.dot(u, arbitrary_vec)) > 0.99:
+        arbitrary_vec = np.array([0.0, 1.0, 0.0])
+    
+    v = np.cross(u, arbitrary_vec)
+    v = v / np.linalg.norm(v)
+    w = np.cross(u, v)
+    
+    # 3. 获取键长与键角
+    bond_length = config.BOND_LENGTHS.get(element, 1.09)
+    theta_rad = np.radians(config.TETRAHEDRAL_ANGLE)
+    
+    # 计算在轴向上的投影长度 (注意方向向外延伸) 和旋转圆半径
+    h_proj_u = bond_length * np.cos(np.pi - theta_rad)
+    h_radius = bond_length * np.sin(np.pi - theta_rad)
+    
+    # 4. 生成 360 度的离散坐标点
+    h_positions = []
+    angles = np.linspace(0, 2 * np.pi, num_samples, endpoint=False)
+    for phi in angles:
+        displacement = h_radius * np.cos(phi) * v + h_radius * np.sin(phi) * w
+        h_pos = x_pos + (h_proj_u * u) + displacement
+        h_positions.append(h_pos)
+        
+    return h_positions
