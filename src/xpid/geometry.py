@@ -96,37 +96,57 @@ def calculate_projection_dist(normal: np.ndarray, pi_center: np.ndarray, x_pos: 
     projection_point = x_pos + t * normal
     return np.linalg.norm(projection_point - pi_center)
 
-def calculate_cone_alignment(parent_pos: np.ndarray, x_pos: np.ndarray, pi_center: np.ndarray, 
-                             ideal_angle: float, tolerance: float) -> Tuple[bool, float, float]:
+def check_hbond_locked(x_pos: np.ndarray, 
+                       orig_h_positions: list, 
+                       acceptor_coords: np.ndarray, 
+                       dist_cutoff: float = 3.5, 
+                       angle_cutoff_deg: float = 120.0) -> bool:
     """
-    Checks if the Pi center lies on the cone surface defined by Parent->X axis.
-    Returns: (Passed?, ActualAngle, Delta)
+    检查原始极性氢是否已经被周围的强氢键网络“锁定”。
+    如果存在 D-H...A 夹角 > 120° 且 H...A 距离 < 3.5 Å 的情况，返回 True。
     """
-    vec_axis = x_pos - parent_pos
-    vec_target = pi_center - x_pos
-    
-    norm_axis = np.linalg.norm(vec_axis)
-    norm_target = np.linalg.norm(vec_target)
-    
-    if norm_axis == 0 or norm_target == 0:
-        return False, 0.0, 999.0
+    if len(acceptor_coords) == 0 or len(orig_h_positions) == 0:
+        return False
         
-    cos_alpha = np.clip(np.dot(vec_axis, vec_target) / (norm_axis * norm_target), -1.0, 1.0)
-    alpha = np.degrees(np.arccos(cos_alpha))
-    
-    delta = abs(alpha - ideal_angle)
-    
-    passed = delta <= tolerance
-    return passed, alpha, delta
+    for h_pos in orig_h_positions:
+        vec_xh = h_pos - x_pos
+        norm_xh = np.linalg.norm(vec_xh)
+        if norm_xh == 0: continue
+        vec_xh_norm = vec_xh / norm_xh
+        
+        # 计算氢原子到所有潜在受体的距离
+        dists = np.linalg.norm(acceptor_coords - h_pos, axis=1)
+        valid_acceptors = acceptor_coords[dists <= dist_cutoff]
+        
+        for acc in valid_acceptors:
+            vec_ha = acc - h_pos
+            norm_ha = np.linalg.norm(vec_ha)
+            if norm_ha == 0: continue
+            
+            # 计算 D-H...A 夹角 (通过向量点乘)
+            cos_theta = np.dot(-vec_xh_norm, vec_ha / norm_ha)
+            angle = np.degrees(np.arccos(np.clip(cos_theta, -1.0, 1.0)))
+            
+            if angle >= angle_cutoff_deg:
+                return True # 被强氢键锁定！
+                
+    return False
 
-def generate_rotated_hydrogens(parent_pos: np.ndarray, x_pos: np.ndarray, element: str, num_samples: int = 36) -> list:
+def generate_rotated_hydrogens(parent_pos: np.ndarray, 
+                               x_pos: np.ndarray, 
+                               element: str, 
+                               env_coords: np.ndarray = None, 
+                               clash_cutoff: float = 2.0,
+                               num_samples: int = 72) -> list:
+    """
+    带有环境感知(位阻检查)的圆锥氢原子生成器。
+    """
     axis = x_pos - parent_pos
     norm_axis = np.linalg.norm(axis)
     if norm_axis == 0: 
         return []
     u = axis / norm_axis 
     
-    # 2. 构建与轴垂直的两个正交基向量 (v, w)
     arbitrary_vec = np.array([1.0, 0.0, 0.0])
     if np.abs(np.dot(u, arbitrary_vec)) > 0.99:
         arbitrary_vec = np.array([0.0, 1.0, 0.0])
@@ -135,20 +155,27 @@ def generate_rotated_hydrogens(parent_pos: np.ndarray, x_pos: np.ndarray, elemen
     v = v / np.linalg.norm(v)
     w = np.cross(u, v)
     
-    # 3. 获取键长与键角
-    bond_length = config.BOND_LENGTHS.get(element, 1.09)
+    # 获取键长与键角 (需确保你的 config 中有这些字典)
+    bond_length = config.BOND_LENGTHS.get(element, 1.09) # 默认 O-H 或 N-H 键长
     theta_rad = np.radians(config.TETRAHEDRAL_ANGLE)
     
-    # 计算在轴向上的投影长度 (注意方向向外延伸) 和旋转圆半径
     h_proj_u = bond_length * np.cos(np.pi - theta_rad)
     h_radius = bond_length * np.sin(np.pi - theta_rad)
     
-    # 4. 生成 360 度的离散坐标点
     h_positions = []
     angles = np.linspace(0, 2 * np.pi, num_samples, endpoint=False)
+    
     for phi in angles:
         displacement = h_radius * np.cos(phi) * v + h_radius * np.sin(phi) * w
         h_pos = x_pos + (h_proj_u * u) + displacement
+        
+        # 💥 核心防线：空间位阻检查 (Clash Check)
+        if env_coords is not None and len(env_coords) > 0:
+            # 使用 numpy 向量化计算该虚拟氢原子与周围所有重原子的距离
+            min_dist = np.min(np.linalg.norm(env_coords - h_pos, axis=1))
+            if min_dist < clash_cutoff:
+                continue # 发生物理碰撞，直接丢弃该构象！
+                
         h_positions.append(h_pos)
         
     return h_positions

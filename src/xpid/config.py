@@ -44,24 +44,23 @@ _saved_path = load_saved_mon_lib()
 DEFAULT_MON_LIB_PATH = _env_path if _env_path else _saved_path
 DEFAULT_H_CHANGE = 4 
 
-# --- Fallback Manual Ring Definitions (kept as safety net for cases with no monomer library) ---
 FALLBACK_RINGS: Dict[str, List[Set[str]]] = {
-    # 'TRP': [
-    #     {'CD2', 'CE2', 'CE3', 'CZ2', 'CZ3', 'CH2'},  # 6-ring
-    #     {'CD1', 'CD2', 'NE1', 'CG', 'CE2'}           # 5-ring
-    # ],
-    # 'TYR': [{'CD1', 'CD2', 'CE1', 'CE2', 'CZ', 'CG'}],
-    # 'PTR': [{'CD1', 'CD2', 'CE1', 'CE2', 'CZ', 'CG'}],
-    # 'PHE': [{'CD1', 'CD2', 'CE1', 'CE2', 'CZ', 'CG'}],
-    # 'HIS': [{'CE1', 'ND1', 'NE2', 'CG', 'CD2'}],
-    # 'BER': [
-    #     {'C1', 'N1', 'C3', 'C6', 'C8', 'C12'},
-    #     {'C8', 'C12', 'C13', 'C15', 'C16', 'C18'},
-    #     {'C2', 'C4', 'C5', 'C9', 'C11', 'C14'},
-    # ],
-    # '4PO': [
-    #     {'N2', 'C6', 'C7', 'C8', 'C9', 'C10'}
-    # ]
+    'TRP': [
+        {'CD2', 'CE2', 'CE3', 'CZ2', 'CZ3', 'CH2'},  # 6-ring
+        {'CD1', 'CD2', 'NE1', 'CG', 'CE2'}           # 5-ring
+    ],
+    'TYR': [{'CD1', 'CD2', 'CE1', 'CE2', 'CZ', 'CG'}],
+    'PTR': [{'CD1', 'CD2', 'CE1', 'CE2', 'CZ', 'CG'}],
+    'PHE': [{'CD1', 'CD2', 'CE1', 'CE2', 'CZ', 'CG'}],
+    'HIS': [{'CE1', 'ND1', 'NE2', 'CG', 'CD2'}],
+    'BER': [
+        {'C1', 'N1', 'C3', 'C6', 'C8', 'C12'},
+        {'C8', 'C12', 'C13', 'C15', 'C16', 'C18'},
+        {'C2', 'C4', 'C5', 'C9', 'C11', 'C14'},
+    ],
+    '4PO': [
+        {'N2', 'C6', 'C7', 'C8', 'C9', 'C10'}
+    ]
 }
 
 # --- Cache ---
@@ -229,19 +228,7 @@ BOND_LENGTHS = {
     'O': 0.96, 
     'S': 1.33
 }
-TETRAHEDRAL_ANGLE = 109.5  # sp3 杂化的典型 Parent-X-H 角度
-
-# CONE_PARAMS = {
-#     'METHYL': {'angle': 70.5, 'tolerance': 25.0},
-#     'OH_SH':  {'angle': 70.5, 'tolerance': 15.0},
-#     'AMINE':  {'angle': 70.5, 'tolerance': 20.0}
-# }
-
-# def get_cone_params(atom_element: str) -> Dict[str, float]:
-#     if atom_element == 'C': return CONE_PARAMS['METHYL']
-#     if atom_element in ('O', 'S'): return CONE_PARAMS['OH_SH']
-#     if atom_element == 'N': return CONE_PARAMS['AMINE']
-#     return {'angle': 70.5, 'tolerance': 20.0}
+TETRAHEDRAL_ANGLE = 109.5 
 
 DIST_SEARCH_LIMIT = 6.0
 THRESHOLDS = {

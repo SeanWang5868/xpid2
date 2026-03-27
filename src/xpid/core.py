@@ -126,7 +126,18 @@ def _detect_residue(pdb_name, resolution, model, model_id, chain, residue, ns, s
         
         if filter_donor and x_res_name not in filter_donor: continue
         if filter_donor_atom and x_atom.name not in filter_donor_atom: continue
-        
+
+        if (x_res_name in ('ASP', 'GLU') and x_atom.name in ('OD1', 'OD2', 'OE1', 'OE2')) or \
+           (x_atom.name == 'OXT'):
+            continue
+            
+        allow_cone_scan = True
+        if (x_res_name == 'ARG' and x_atom.name in ('NH1', 'NH2', 'NE')) or \
+           (x_res_name in ('ASN', 'GLN') and x_atom.name in ('ND2', 'NE2')) or \
+           (x_res_name == 'HIS' and x_atom.name in ('ND1', 'NE2')) or \
+           (x_res_name == 'TRP' and x_atom.name == 'NE1'):
+            allow_cone_scan = False
+
         if _is_donor_blocked(x_atom, model, ns):
             continue
 
@@ -150,24 +161,30 @@ def _detect_residue(pdb_name, resolution, model, model_id, chain, residue, ns, s
         
         proj_threshold = 2.0 if ring_size == 6 else 1.6
         
-        # 标志位：是否已经在显式氢中找到了相互作用
         found_explicit_interaction = False
+        orig_h_positions = [] # 用于安全存储真正的显式氢坐标，供后面圆锥算法使用
 
         # ---------------------------------------------------------------------
-        # 🔵 第一梯队：显式精确几何算法 (优先尊重配体库默认加氢的低位阻构象)
+        # 🔵 第一梯队：显式精确几何算法 
         # ---------------------------------------------------------------------
         h_candidates = ns.find_atoms(x_atom.pos, alt=x_atom.altloc, radius=config.DIST_CUTOFF_H)
-        
+
         for h_mark in h_candidates:
             h_cra = h_mark.to_cra(model)
             h_atom = h_cra.atom
-            if h_atom.element not in config.TARGET_ELEMENTS_H: continue
+            
+            # 💡 修复 Bug 1 & 3: 使用纯字符串集合判断，确保只捞出真实的 H/D 原子
+            if h_atom.element.name.upper() not in {'H', 'D'}: 
+                continue
+                
+            # 保存真正的氢原子坐标，避免捞到供体原子自己
+            h_pos_arr = np.array(h_atom.pos.tolist())
+            orig_h_positions.append(h_pos_arr)
             
             if h_atom.altloc and x_atom.altloc and h_atom.altloc != x_atom.altloc:
                 continue
             
             h_combined_occ = min(combined_occ, h_atom.occ)
-            h_pos_arr = np.array(h_atom.pos.tolist())
             
             xh_pi_angle = geometry.calculate_xh_picenter_angle(pi_center_arr, x_pos_arr, h_pos_arr)
             theta = geometry.calculate_hudson_theta(pi_center_arr, x_pos_arr, h_pos_arr, pi_normal)
@@ -175,16 +192,11 @@ def _detect_residue(pdb_name, resolution, model, model_id, chain, residue, ns, s
             if xh_pi_angle is None or theta is None or xpcn_angle is None: continue
 
             plevin = 0
-            if (dist_x_pi < max_dist and 
-                xh_pi_angle > 120.0 and 
-                xpcn_angle < 25.0):
+            if (dist_x_pi < max_dist and xh_pi_angle >= 120.0 and xpcn_angle < 25.0):
                 plevin = 1
             
             hudson = 0
-            if (proj_dist is not None and 
-                theta <= 40.0 and 
-                dist_x_pi <= max_dist and 
-                proj_dist <= proj_threshold):
+            if (proj_dist is not None and theta <= 40.0 and dist_x_pi <= max_dist and proj_dist <= proj_threshold):
                 hudson = 1
             
             if plevin == 1 or hudson == 1:
@@ -197,9 +209,10 @@ def _detect_residue(pdb_name, resolution, model, model_id, chain, residue, ns, s
                             "Explicit", None, h_combined_occ, ring_size, min_occ)
 
         # ---------------------------------------------------------------------
-        # 🔴 第二梯队：热力学限制的诱导契合与构象救援算法
+        # 🔴 第二梯队：热力学限制的诱导契合与构象救援算法 (圆锥算法)
+        # 💡 修复 Bug 2: 删除了这里原本错误嵌套的 for x_mark in x_candidates 循环
         # ---------------------------------------------------------------------
-        if not found_explicit_interaction and use_cone and x_res_name in config.ROTATABLE_MAPPING:
+        if not found_explicit_interaction and use_cone and allow_cone_scan and x_res_name in config.ROTATABLE_MAPPING:
             parent_name = config.ROTATABLE_MAPPING[x_res_name].get(x_atom.name)
             
             if parent_name:
@@ -208,58 +221,87 @@ def _detect_residue(pdb_name, resolution, model, model_id, chain, residue, ns, s
                 if parent_atom:
                     parent_pos_arr = np.array(parent_atom.pos.tolist())
                     
-                    # 具有诱导契合能力的柔性基团 (低旋转势垒，允许 360° 连续扫描)
-                    flexible_donors = {('SER', 'OG'), ('THR', 'OG1'), ('TYR', 'OH'), ('CYS', 'SG')}
+                    # 1. 提取局部重原子与极性原子 (用于位阻和氢键锁)
+                    search_radius = 4.0
+                    neighbors = ns.find_atoms(x_atom.pos, radius=search_radius)
                     
-                    # 生成当前评估的一批虚拟氢候选位置
+                    env_coords_list = []
+                    acceptor_coords_list = []
+                    
+                    for n_mark in neighbors:
+                        if n_mark.pos.dist(x_atom.pos) < 0.01: continue
+                        n_cra = n_mark.to_cra(model)
+                        
+                        # 排除供体自身残基
+                        if n_cra.residue.seqid == x_res.seqid and n_cra.chain.name == x_cra.chain.name:
+                            continue
+                            
+                        n_elem = n_cra.atom.element.name.upper()
+                        if n_elem in ('H', 'D', ''): continue
+                        
+                        n_pos_arr = np.array(n_cra.atom.pos.tolist())
+                        dist = np.linalg.norm(n_pos_arr - x_pos_arr)
+                        
+                        if dist <= 4.0:
+                            env_coords_list.append(n_pos_arr)
+                        if dist <= 3.5 and n_elem in ('O', 'N', 'S'):
+                            acceptor_coords_list.append(n_pos_arr)
+                            
+                    env_coords = np.array(env_coords_list) if env_coords_list else np.array([])
+                    acceptor_coords = np.array(acceptor_coords_list) if acceptor_coords_list else np.array([])
+                    
+                    # 2. 强氢键锁定判断 (直接使用我们上面提取干净的 orig_h_positions)
+                    is_locked = geometry.check_hbond_locked(x_pos_arr, orig_h_positions, acceptor_coords)
+                    
                     h_candidates_cone = []
-                    if (x_res_name, x_atom.name) in flexible_donors:
-                        # 阵营 B：柔性基团 - 经典 360° 全景扫描 (36 个点)
-                        h_candidates_cone = geometry.generate_rotated_hydrogens(
-                            parent_pos_arr, x_pos_arr, x_atom.element.name, num_samples=72
-                        )
-                    else:
-                        # 阵营 A：受限于交错态的刚性转子 (如甲基、铵基)沿用 CCP4 找好的交错态(显式H)，仅允许小幅热振动摆动
-                        axis = x_pos_arr - parent_pos_arr
-                        axis_norm = np.linalg.norm(axis)
-                        if axis_norm > 1e-5:
-                            axis = axis / axis_norm
-                            
-                            # 定义摆动角度 (例如 ±10度 和 ±20度，模拟热力学谷底的微小涨落)
-                            wobble_angles_deg = [angle for angle in range(-20, 21, 5) if angle != 0]
-                            
-                            for h_mark in h_candidates: # 复用第一梯队未能命中的显式氢
-                                h_pos_orig = np.array(h_mark.to_cra(model).atom.pos.tolist())
-                                vec_xh = h_pos_orig - x_pos_arr
+                    
+                    if not is_locked:
+                        flexible_donors = {('SER', 'OG'), ('THR', 'OG1'), ('TYR', 'OH'), ('CYS', 'SG')}
+                        
+                        if (x_res_name, x_atom.name) in flexible_donors:
+                            h_candidates_cone = geometry.generate_rotated_hydrogens(
+                                parent_pos_arr, x_pos_arr, x_elem, 
+                                env_coords=env_coords, clash_cutoff=2.0, num_samples=72
+                            )
+                        else:
+                            axis = x_pos_arr - parent_pos_arr
+                            axis_norm = np.linalg.norm(axis)
+                            if axis_norm > 1e-5:
+                                axis = axis / axis_norm
+                                wobble_angles_deg = [angle for angle in range(-20, 21, 5) if angle != 0]
                                 
-                                for angle_deg in wobble_angles_deg:
-                                    theta_rad = np.radians(angle_deg)
-                                    cos_theta = np.cos(theta_rad)
-                                    sin_theta = np.sin(theta_rad)
-                                    
-                                    # Rodrigues' rotation formula 绕轴旋转向量
-                                    cross_prod = np.cross(axis, vec_xh)
-                                    dot_prod = np.dot(axis, vec_xh)
-                                    
-                                    vec_xh_rotated = (vec_xh * cos_theta + 
-                                                      cross_prod * sin_theta + 
-                                                      axis * dot_prod * (1 - cos_theta))
-                                    
-                                    h_pos_wobbled = x_pos_arr + vec_xh_rotated
-                                    h_candidates_cone.append(h_pos_wobbled)
+                                for h_pos_orig in orig_h_positions:
+                                    vec_xh = h_pos_orig - x_pos_arr
+                                    for angle_deg in wobble_angles_deg:
+                                        theta_rad = np.radians(angle_deg)
+                                        cos_theta = np.cos(theta_rad)
+                                        sin_theta = np.sin(theta_rad)
+                                        
+                                        cross_prod = np.cross(axis, vec_xh)
+                                        dot_prod = np.dot(axis, vec_xh)
+                                        
+                                        vec_xh_rotated = (vec_xh * cos_theta + 
+                                                          cross_prod * sin_theta + 
+                                                          axis * dot_prod * (1 - cos_theta))
+                                        
+                                        h_pos_wobbled = x_pos_arr + vec_xh_rotated
+                                        
+                                        if len(env_coords) > 0:
+                                            min_dist = np.min(np.linalg.norm(env_coords - h_pos_wobbled, axis=1))
+                                            if min_dist < 2.0: continue
+                                                
+                                        h_candidates_cone.append(h_pos_wobbled)
 
-                    # 2. 统一对生成的候选氢原子进行几何评估
+                    # 3. 对候选氢原子进行评分筛选最优解
                     best_hit = None
-                    best_xh_angle = -1.0  # 用于寻找最接近 180 度的最优构象
+                    best_xh_angle = -1.0  
                     
                     for h_pos_np in h_candidates_cone:
                         theta = geometry.calculate_hudson_theta(pi_center_arr, x_pos_arr, h_pos_np, pi_normal)
                         xh_pi_angle = geometry.calculate_xh_picenter_angle(pi_center_arr, x_pos_arr, h_pos_np)
                         
-                        if theta is None or xh_pi_angle is None:
-                            continue
+                        if theta is None or xh_pi_angle is None: continue
                             
-                        # 严格套用同样的 Plevin 和 Hudson 标准
                         is_plevin_cand = (dist_x_pi < max_dist and xpcn_angle < 25.0 and xh_pi_angle >= 120.0)
                         is_hudson_cand = (dist_x_pi <= max_dist and proj_dist is not None and proj_dist <= proj_threshold and theta <= 40.0)
                         
@@ -276,17 +318,15 @@ def _detect_residue(pdb_name, resolution, model, model_id, chain, residue, ns, s
 
                     if best_hit is not None:
                         detected_mode = "Implicit/Cone_Rescue"
-                        final_h_name = "(virt)"
                         final_theta = best_hit['theta']
                         final_xh_pi_angle = best_hit['xh_pi_angle']
                         
                         _record_hit(hits, pdb_name, model_id, resolution, chain, residue, 
-                                    x_cra, x_atom, final_h_name, dist_x_pi, 
+                                    x_cra, x_atom, "(virt)", dist_x_pi, 
                                     int(best_hit['is_plevin']), int(best_hit['is_hudson']), mode, 
                                     pi_center_arr, pi_b_mean, x_pos_arr, ss_index, 
                                     final_theta, final_xh_pi_angle, xpcn_angle, proj_dist, 
                                     detected_mode, 0.0, combined_occ, ring_size, min_occ)
-
     return hits
 
 def _record_hit(hits: List[Dict[str, Any]], pdb: str, mid: str, res: float, pi_chain, pi_res, 
