@@ -260,6 +260,7 @@ def process_one_file(args_packet):
     try:
         # 直接使用 gemmi 读取结构（支持 .gz）
         structure = gemmi.read_structure(str(filepath))
+        structure.remove_alternative_conformations()
         
         if not structure or len(structure) == 0:
             return f"Empty or invalid structure: {filepath}", 0, [], None
