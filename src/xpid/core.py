@@ -27,6 +27,9 @@ def detect_interactions_in_structure(structure: gemmi.Structure,
     results = []
     if not structure or len(structure) == 0: return []
 
+    structure.remove_alternative_conformations()
+    structure.remove_empty_chains()
+
     models_with_ids = [] 
     if model_mode == 'all':
         for i, m in enumerate(structure):
