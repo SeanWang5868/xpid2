@@ -4,6 +4,7 @@ Handles structure preparation and Hydrogen addition.
 """
 import gemmi
 import os
+import re
 import logging
 from typing import Optional
 
@@ -36,31 +37,56 @@ def add_hydrogens_memory(structure: gemmi.Structure,
             try: monlib.read_monomer_lib(mon_lib_path, missing)
             except: pass
 
-        # ---------------------------------------------------------
-        # 🌟 修复区：增加错误重试机制 (Fallback Mechanism)
-        # ---------------------------------------------------------
-        try:
-            # 第一次尝试：保留所有原始连接信息进行拓扑构建
-            gemmi.prepare_topology(structure, monlib, model_index=0, h_change=h_change_val, reorder=False, ignore_unknown_links=True)
-        except Exception as topo_err:
-            err_msg = str(topo_err).lower()
-            # 扩大捕获范围：只要报错信息里包含 "link" 这个词，统统进入抢救流程
-            if "link" in err_msg:
-                # 打印具体的报错原因，方便你查看
-                logger.warning(f"  -> Bad explicit link detected: '{str(topo_err)}'. Clearing connections and retrying...")
-                # 清除 CIF 文件中携带的所有 explicit links
-                structure.connections.clear()
-                
-                # 第二次尝试：依赖距离和标准氨基酸字典重新构建拓扑加氢
+
+        max_attempts = 10  # 最多允许自动切除 10 个坏死残基
+        for attempt in range(max_attempts):
+            try:
+                # 尝试构建拓扑与加氢
                 gemmi.prepare_topology(structure, monlib, model_index=0, h_change=h_change_val, reorder=False, ignore_unknown_links=True)
-            else:
-                # 如果是其他严重的底层错误，抛出交给外层处理
-                raise topo_err
+                break  # 如果毫无报错，直接跳出重试循环！
+                
+            except Exception as topo_err:
+                err_msg = str(topo_err)
+                
+                # 策略 1：如果是未知 Link 报错，清空连接信息并重试
+                if "link" in err_msg.lower():
+                    logger.warning(f"  -> Bad explicit link detected. Clearing connections and retrying...")
+                    structure.connections.clear()
+                    continue  # 继续下一次尝试
+                    
+                # 策略 2：几何扭曲报错 (精准切除)
+                # 解析报错格式，例如: "bonded to V/NAG 2/O4 failed"
+                match = re.search(r"bonded to ([^/]+)/([^ ]+) ([^/]+)/([^ ]+) failed", err_msg)
+                if match:
+                    bad_chain = match.group(1)   # 例如 'V'
+                    bad_seqid = match.group(3)   # 例如 '2'
+                    
+                    removed = False
+                    for model in structure:
+                        for chain in model:
+                            if chain.name == bad_chain:
+                                for i in range(len(chain)):
+                                    # 匹配序列号，剥离空格
+                                    if str(chain[i].seqid).strip() == bad_seqid.strip():
+                                        del chain[i]  # 核心：直接把这个残基从链中删除！
+                                        removed = True
+                                        logger.warning(f"  -> Removed twisted residue {bad_chain}/{bad_seqid} to save the rest of the structure.")
+                                        break
+                            if removed: break
+                        if removed: break
+                        
+                    if removed:
+                        continue  # 成功切除后，重新启动加氢进程！
+                
+                # 策略 3：如果正则没匹配上，或者超过最大重试次数
+                logger.warning(f"  -> Topology incomplete after {attempt} retries: {err_msg}.")
+                break  # 停止重试，带着现有（部分加氢）的残基继续前进
         # ---------------------------------------------------------
 
         structure.setup_cell_images()
         return structure
         
     except Exception as e:
-        logger.error(f"Topology failed: {e}")
-        return None
+        logger.error(f"Critical error in prep: {e}")
+        # ⚠️ 绝对不能 return None！如果全盘崩溃，至少返回原始结构，保证主流程不中断
+        return structure
