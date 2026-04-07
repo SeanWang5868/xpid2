@@ -12,7 +12,7 @@ def build_index(structure: gemmi.Structure) -> Dict[str, List[Tuple[int, int, st
     if hasattr(structure, 'helices'):
         for h in structure.helices:
             try:
-                code = h.pdb_helix_class.name
+                code = h.pdb_helix_class
                 add(h.start.chain_name, h.start.res_id.seqid.num, h.end.res_id.seqid.num, code, str(helix_uid))
                 helix_uid += 1
             except: pass
