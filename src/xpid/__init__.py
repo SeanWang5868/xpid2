@@ -17,6 +17,9 @@ def detect(
     """
     API entry point to run analysis on a single file from Python code.
     """
+    if mon_lib_path is None:
+        mon_lib_path = config.DEFAULT_MON_LIB_PATH
+
     path_obj = Path(file_path)
     # Handle filename extraction
     if path_obj.name.count('.') > 1:
