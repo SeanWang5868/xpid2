@@ -3,12 +3,15 @@ config.py
 Configuration constants, atom definitions, and geometric thresholds.
 """
 import gemmi
+import logging
 import os
 import json
 from pathlib import Path
 from typing import Dict, Set, Optional, List
 
 from collections import defaultdict
+
+logger = logging.getLogger("xpid.config")
 
 # --- Configuration Management ---
 CONFIG_FILE = Path.home() / ".xpid_config.json"
@@ -66,7 +69,7 @@ FALLBACK_RINGS: Dict[str, List[Set[str]]] = {
 # --- Cache ---
 AROMATIC_RINGS_CACHE: Dict[str, List[Set[str]]] = {}
 
-# --- Robust Aromatic Ring Detection (strictly following your direct CIF parsing + DFS logic) ---
+# --- Aromatic Ring Detection (CIF plane restraints -> DFS cycle search -> fallback) ---
 def get_aromatic_rings(res_name: str, mon_lib_path: Optional[str] = None) -> List[Set[str]]:
     """
     Detect all possible 5/6-membered aromatic rings by direct CIF parsing.
@@ -150,7 +153,14 @@ def get_aromatic_rings(res_name: str, mon_lib_path: Optional[str] = None) -> Lis
                         
                         found_rings = set()
                         
+                        _MAX_DFS_VISITED = 500  # Safety limit for large conjugated systems
+                        _dfs_visits = 0
+
                         def dfs(path: List[str], start: str):
+                            nonlocal _dfs_visits
+                            _dfs_visits += 1
+                            if _dfs_visits > _MAX_DFS_VISITED:
+                                return
                             if len(path) > 8:
                                 return
                             cur = path[-1]
@@ -171,7 +181,7 @@ def get_aromatic_rings(res_name: str, mon_lib_path: Optional[str] = None) -> Lis
                                 seen.add(ring_set)
                                 
             except Exception as e:
-                print(f"Warning: Failed to parse CIF for {res_name} at {cif_path}: {str(e)}")
+                logger.warning(f"Failed to parse CIF for {res_name} at {cif_path}: {e}")
     
     # === 3. Final safety fallback (only if nothing found and no library coverage) ===
     if not rings and res_name in FALLBACK_RINGS:
@@ -180,10 +190,6 @@ def get_aromatic_rings(res_name: str, mon_lib_path: Optional[str] = None) -> Lis
     AROMATIC_RINGS_CACHE[res_name] = rings
     return rings
 
-# --- Rest completely unchanged ---
-TARGET_ELEMENTS_X = {gemmi.Element('C'), gemmi.Element('N'), gemmi.Element('O'), gemmi.Element('S')}
-TARGET_ELEMENTS_H = {gemmi.Element('H'), gemmi.Element('D')}
-
 ROTATABLE_MAPPING: Dict[str, Dict[str, str]] = {
     'ALA': {'CB': 'CA'},
     'VAL': {'CG1': 'CB', 'CG2': 'CB'},
@@ -191,24 +197,23 @@ ROTATABLE_MAPPING: Dict[str, Dict[str, str]] = {
     'ILE': {'CD1': 'CG1', 'CG2': 'CB'}, 
     'MET': {'CE': 'SD'},
     'MSE': {'CE': 'SE'},
-    'THR': {'CG2': 'CB'},
+    'THR': {'CG2': 'CB', 'OG1': 'CB'},
     'SER': {'OG': 'CB'},
-    'THR': {'OG1': 'CB'},
     'TYR': {'OH': 'CZ'},
     'CYS': {'SG': 'CB'},
     'LYS': {'NZ': 'CE'}
 }
 
-# 阵营 B: 具有诱导契合能力的柔性基团 (低旋转势垒，约 1-2 kcal/mol，允许 360° 连续扫描)
-FLEXIBLE_DONORS = {'OG', 'OG1', 'OH', 'SG'}  
+# Flexible donors: low rotational barrier (~1-2 kcal/mol), continuous 360° scan
+FLEXIBLE_DONORS = {'OG', 'OG1', 'OH', 'SG'}
 
-# 阵营 A: 受限于交错态的刚性转子 (高三重扭转势垒，约 3 kcal/mol，仅允许 3 态离散扫描)
+# Rigid rotors: high three-fold torsional barrier (~3 kcal/mol), discrete staggered states
 RIGID_DONORS = {'CB', 'CG1', 'CG2', 'CD1', 'CD2', 'CE', 'NZ'} 
 
-# 祖父原子映射字典 (Grandparent Mapping) 
-# 必需！用于定义参考平面，从而计算出甲基/铵基那 3 个绝对准确的交错态位置
+# Grandparent atom mapping: defines the reference plane for computing
+# staggered rotamer positions of methyl / ammonium groups.
 GRANDPARENT_MAPPING: Dict[str, Dict[str, str]] = {
-    'ALA': {'CB': 'N'},           # CA 的母体，用骨架 N 作为参考相
+    'ALA': {'CB': 'N'},
     'VAL': {'CG1': 'CA', 'CG2': 'CA'},
     'LEU': {'CD1': 'CB', 'CD2': 'CB'},
     'ILE': {'CD1': 'CB', 'CG2': 'CA'},
@@ -216,7 +221,7 @@ GRANDPARENT_MAPPING: Dict[str, Dict[str, str]] = {
     'MSE': {'CE': 'CG'},
     'THR': {'CG2': 'CA', 'OG1': 'CA'},
     'SER': {'OG': 'CA'},
-    'TYR': {'OH': 'CE1'},         # 实际上分在柔性组，这里备用
+    'TYR': {'OH': 'CE1'},
     'CYS': {'SG': 'CA'},
     'LYS': {'NZ': 'CD'}
 }
@@ -239,3 +244,16 @@ THRESHOLDS = {
     'default': 4.5
 }
 DIST_CUTOFF_H = 1.3
+
+# Cation-π donor atoms (positively charged groups)
+CATION_DONORS = {
+    ('LYS', 'NZ'),
+    ('ARG', 'NH1'),
+    ('ARG', 'NH2'),
+    ('ARG', 'NE'),
+}
+
+# π-π stacking thresholds
+PI_PI_DIST_MAX = 5.5
+PI_PI_ANGLE_PARALLEL_MAX = 35.0
+PI_PI_ANGLE_TSHAPED_MIN = 60.0

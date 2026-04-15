@@ -8,7 +8,7 @@ from typing import Tuple, Optional, List
 from . import config
 
 def get_pi_info(atoms: List[gemmi.Atom]) -> Tuple[gemmi.Position, np.ndarray, np.ndarray, float]:
-    positions = np.array([atom.pos.tolist() for atom in atoms])
+    positions = np.array([[atom.pos.x, atom.pos.y, atom.pos.z] for atom in atoms])
     center_array = np.mean(positions, axis=0)
     pi_center = gemmi.Position(*center_array)
     b_mean = sum(atom.b_iso for atom in atoms) / len(atoms)
@@ -33,7 +33,7 @@ def calculate_planarity_deviation(atoms: List[gemmi.Atom]) -> float:
     
     max_dev = 0.0
     for atom in atoms:
-        pos_arr = np.array(atom.pos.tolist())
+        pos_arr = np.array([atom.pos.x, atom.pos.y, atom.pos.z])
         vec = pos_arr - center_arr
         dev = np.abs(np.dot(normal, vec))
         if dev > max_dev:
@@ -101,9 +101,9 @@ def check_hbond_locked(x_pos: np.ndarray,
                        acceptor_coords: np.ndarray, 
                        dist_cutoff: float = 3.5, 
                        angle_cutoff_deg: float = 120.0) -> bool:
-    """
-    检查原始极性氢是否已经被周围的强氢键网络“锁定”。
-    如果存在 D-H...A 夹角 > 120° 且 H...A 距离 < 3.5 Å 的情况，返回 True。
+    """Check if a donor's polar hydrogen is locked by a strong hydrogen bond.
+
+    Returns True if any D-H...A angle >= 120° and H...A distance <= 3.5 Å.
     """
     if len(acceptor_coords) == 0 or len(orig_h_positions) == 0:
         return False
@@ -114,7 +114,7 @@ def check_hbond_locked(x_pos: np.ndarray,
         if norm_xh == 0: continue
         vec_xh_norm = vec_xh / norm_xh
         
-        # 计算氢原子到所有潜在受体的距离
+        # Compute distances from H to all potential acceptors
         dists = np.linalg.norm(acceptor_coords - h_pos, axis=1)
         valid_acceptors = acceptor_coords[dists <= dist_cutoff]
         
@@ -123,12 +123,12 @@ def check_hbond_locked(x_pos: np.ndarray,
             norm_ha = np.linalg.norm(vec_ha)
             if norm_ha == 0: continue
             
-            # 计算 D-H...A 夹角 (通过向量点乘)
+            # D-H...A angle via dot product
             cos_theta = np.dot(-vec_xh_norm, vec_ha / norm_ha)
             angle = np.degrees(np.arccos(np.clip(cos_theta, -1.0, 1.0)))
             
             if angle >= angle_cutoff_deg:
-                return True # 被强氢键锁定！
+                return True  # Locked by a strong hydrogen bond
                 
     return False
 
@@ -138,9 +138,7 @@ def generate_rotated_hydrogens(parent_pos: np.ndarray,
                                env_coords: np.ndarray = None, 
                                clash_cutoff: float = 2.0,
                                num_samples: int = 72) -> list:
-    """
-    带有环境感知(位阻检查)的圆锥氢原子生成器。
-    """
+    """Vectorized cone hydrogen generator with steric clash filtering."""
     axis = x_pos - parent_pos
     norm_axis = np.linalg.norm(axis)
     if norm_axis == 0: 
@@ -155,27 +153,54 @@ def generate_rotated_hydrogens(parent_pos: np.ndarray,
     v = v / np.linalg.norm(v)
     w = np.cross(u, v)
     
-    # 获取键长与键角 (需确保你的 config 中有这些字典)
-    bond_length = config.BOND_LENGTHS.get(element, 1.09) # 默认 O-H 或 N-H 键长
+    bond_length = config.BOND_LENGTHS.get(element, 1.09)
     theta_rad = np.radians(config.TETRAHEDRAL_ANGLE)
     
     h_proj_u = bond_length * np.cos(np.pi - theta_rad)
     h_radius = bond_length * np.sin(np.pi - theta_rad)
     
-    h_positions = []
+    # Vectorized: generate all H positions at once
     angles = np.linspace(0, 2 * np.pi, num_samples, endpoint=False)
+    cos_phi = np.cos(angles)  # (N,)
+    sin_phi = np.sin(angles)  # (N,)
     
-    for phi in angles:
-        displacement = h_radius * np.cos(phi) * v + h_radius * np.sin(phi) * w
-        h_pos = x_pos + (h_proj_u * u) + displacement
-        
-        # 💥 核心防线：空间位阻检查 (Clash Check)
-        if env_coords is not None and len(env_coords) > 0:
-            # 使用 numpy 向量化计算该虚拟氢原子与周围所有重原子的距离
-            min_dist = np.min(np.linalg.norm(env_coords - h_pos, axis=1))
-            if min_dist < clash_cutoff:
-                continue # 发生物理碰撞，直接丢弃该构象！
-                
-        h_positions.append(h_pos)
-        
-    return h_positions
+    # h_positions shape: (N, 3)
+    h_positions = (x_pos + h_proj_u * u + 
+                   h_radius * cos_phi[:, None] * v + 
+                   h_radius * sin_phi[:, None] * w)
+    
+    # Vectorized clash check
+    if env_coords is not None and len(env_coords) > 0:
+        # diffs shape: (N, M, 3) where M = number of env atoms
+        diffs = h_positions[:, None, :] - env_coords[None, :, :]
+        dists = np.linalg.norm(diffs, axis=2)  # (N, M)
+        min_dists = dists.min(axis=1)  # (N,)
+        mask = min_dists >= clash_cutoff
+        h_positions = h_positions[mask]
+    
+    return [h_positions[i] for i in range(len(h_positions))]
+
+
+def calculate_pi_pi_geometry(center1: np.ndarray, normal1: np.ndarray,
+                             center2: np.ndarray, normal2: np.ndarray
+                             ) -> Tuple[float, float, float]:
+    """Calculate π-π stacking geometry between two aromatic rings.
+    Returns (centroid_dist, inter_normal_angle_deg, lateral_offset)."""
+    vec = center2 - center1
+    dist = np.linalg.norm(vec)
+
+    n1_norm = np.linalg.norm(normal1)
+    n2_norm = np.linalg.norm(normal2)
+    if n1_norm == 0 or n2_norm == 0:
+        return dist, 90.0, dist
+
+    n1 = normal1 / n1_norm
+    n2 = normal2 / n2_norm
+
+    cos_angle = np.clip(np.abs(np.dot(n1, n2)), 0.0, 1.0)
+    angle = np.degrees(np.arccos(cos_angle))
+
+    proj_along = abs(np.dot(vec, n1)) if dist > 0 else 0.0
+    offset = np.sqrt(max(dist**2 - proj_along**2, 0.0))
+
+    return dist, angle, offset

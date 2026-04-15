@@ -6,8 +6,9 @@ src/xpid/cli.py
 src/xpid/config.py
 src/xpid/core.py
 src/xpid/geometry.py
-src/xpid/io.py
+src/xpid/output.py
 src/xpid/prep.py
+src/xpid/resolver.py
 src/xpid/ss.py
 src/xpid/topology.py
 src/xpid.egg-info/PKG-INFO
