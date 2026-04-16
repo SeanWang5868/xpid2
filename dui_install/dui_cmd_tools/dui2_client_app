@@ -1,2 +1,0 @@
-export QTWEBENGINE_DISABLE_SANDBOX=1
-ccp4-python /Users/bql506/XHPI/xpid2/dui_install/DUI2-2025.12.5/src/run_dui2_client.py $@

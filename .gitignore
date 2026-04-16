@@ -1,6 +1,13 @@
-.DS_Store
-__pycache__/
-*.pyc
+# Python build artifacts
 build/
 dist/
-*.log
+*.egg-info/
+__pycache__/
+
+# Local output and temp files
+xpid_output/
+run_dui_tmp
+dui_install/
+
+dui_install/
+install_dui2_after_ccp4_w_curl.sh
