@@ -85,9 +85,9 @@ for hit in results:
 
 | Parameter | Threshold |
 | :--- | :--- |
-| d(X&#8211;C&#960;) | &lt; 4.3 &#8491; |
-| &ang;(X&#8211;H&#8211;C&#960;) | &gt; 120&deg; |
-| &ang;(X&#8211;C&#960;&#8211;**n**) | &lt; 25&deg; |
+| d(X&#8211;C&#960;) | &ge; 4.5 &#8491; |
+| &ang;(X&#8211;H&#8211;C&#960;) | &ge; 120&deg; |
+| &ang;(X&#8211;C&#960;&#8211;**n**) | &ge; 25&deg; |
 
 ## Command-Line Options
 
